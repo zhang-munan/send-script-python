@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bangni-adb-sms-worker"
+version = "0.1.0"
+description = "Poll message_info and dispatch SMS jobs through one or more Android phones over ADB"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "PyMySQL>=1.1.1,<2",
+]
+
+[project.scripts]
+adb-sms-worker = "adb_sms_worker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
