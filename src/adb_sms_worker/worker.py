@@ -39,9 +39,19 @@ class DeviceWorker:
                 logger.info("消息 id=%s 因收件人拉黑已取消", job.id)
                 return
             armed = True
-            self.sender.click_and_verify(self.serial, target, self.settings.sim_slot)
+            evidence = self.sender.click_and_verify(
+                self.serial,
+                target,
+                self.settings.sim_slot,
+                on_clicked=lambda: self.repository.mark_clicked(job),
+            )
             self.repository.mark_success(job)
-            logger.info("消息 id=%s 已由设备 %s 执行发送", job.id, self.serial)
+            logger.info(
+                "消息 id=%s 已由设备 %s 执行发送，确认依据=%s",
+                job.id,
+                self.serial,
+                evidence,
+            )
         except (AdbError, DatabaseError, ValueError) as exc:
             logger.error("消息 id=%s 处理失败: %s", job.id, exc)
             try:

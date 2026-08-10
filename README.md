@@ -14,6 +14,8 @@
 - 真正精准的 `SENT` / `DELIVERED` 回执需要另做一个安装在手机上的 Android Helper App，通过 `SmsManager` 和广播接收器回传结果。Python/ADB 层的调度、审计表和多设备架构可以继续复用。
 - 不同厂商的主要差异是默认短信应用的 UI、锁屏策略、后台限制和双卡选择。发送按钮使用资源 ID、文字和无障碍描述综合识别，不使用固定坐标。
 - 进程在点击阶段异常时，任务会进入 `UNKNOWN`，不会自动重发，避免收件人收到两遍。
+- ADB 成功执行精确按钮点击后会立即持久化 `CLICKED`，随后事务回写业务状态 `5`；vivo 等拒绝 UIAutomator 读取的机型不再因为按钮 View 保留而误报失败。
+- 若进程在 `CLICKED` 后、业务状态回写前中断，下次启动会自动补写为状态 `5`，不会再次发送。
 
 ## 1. 手机准备
 
@@ -123,6 +125,9 @@ adb-sms-worker resolve 123 --sent --yes
 
 # 手机上确认没有发出，重新排队
 adb-sms-worker resolve 123 --retry --yes
+
+# 已逐条在手机会话中确认全部发送后，可批量回写
+adb-sms-worker resolve-all --sent --yes
 ```
 
 ## 6. 多机与机型注意事项

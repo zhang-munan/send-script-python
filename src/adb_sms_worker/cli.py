@@ -42,6 +42,11 @@ def _parser() -> argparse.ArgumentParser:
     group.add_argument("--sent", action="store_true", help="确认手机已发送")
     group.add_argument("--retry", action="store_true", help="确认未发送并重新排队")
     resolve.add_argument("--yes", action="store_true")
+    resolve_all = sub.add_parser("resolve-all", help="批量人工确认所有不确定任务")
+    all_group = resolve_all.add_mutually_exclusive_group(required=True)
+    all_group.add_argument("--sent", action="store_true", help="确认全部已发送")
+    all_group.add_argument("--retry", action="store_true", help="确认全部未发送并重新排队")
+    resolve_all.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -146,8 +151,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"消息 {args.message_id} 已处理")
             return 0
 
+        if args.command == "resolve-all":
+            if not args.yes:
+                print("该操作会批量改变任务状态；确认后请添加 --yes", file=sys.stderr)
+                return 2
+            count = repository.resolve_all_unknown("sent" if args.sent else "retry")
+            print(f"已批量处理 {count} 条不确定任务")
+            return 0
+
         if args.command == "run":
             repository.assert_schema()
+            finalized = repository.finalize_clicked()
+            if finalized:
+                logging.warning("已自动补写 %s 个此前已点击发送的任务", finalized)
             recovered = repository.recover_stale_pre_send(settings.stale_claim_seconds)
             if recovered:
                 logging.warning("已安全恢复 %s 个尚未进入点击阶段的超时任务", recovered)

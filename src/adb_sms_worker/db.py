@@ -112,6 +112,48 @@ class SmsRepository:
                 conn.rollback()
                 raise DatabaseError(f"恢复超时任务失败: {exc}") from exc
 
+    def finalize_clicked(self) -> int:
+        """Finish phone-submitted jobs after a crash or transient DB failure."""
+        with self.connection() as conn, conn.cursor() as cursor:
+            try:
+                conn.begin()
+                cursor.execute(
+                    """
+                    SELECT d.message_id
+                    FROM adb_sms_dispatch d
+                    JOIN message_info m ON m.id=d.message_id
+                    WHERE d.state='CLICKED' AND m.status=4
+                    FOR UPDATE
+                    """
+                )
+                ids = [int(row["message_id"]) for row in cursor.fetchall()]
+                if not ids:
+                    conn.commit()
+                    return 0
+                placeholders = ",".join(["%s"] * len(ids))
+                cursor.execute(
+                    f"""
+                    UPDATE message_info
+                    SET status=5, deliveredAt=COALESCE(deliveredAt, NOW()),
+                        failReason=NULL, updateTime=NOW()
+                    WHERE status=4 AND id IN ({placeholders})
+                    """,
+                    ids,
+                )
+                cursor.execute(
+                    f"""
+                    UPDATE adb_sms_dispatch
+                    SET state='DONE', finished_at=NOW(), last_error=NULL
+                    WHERE state='CLICKED' AND message_id IN ({placeholders})
+                    """,
+                    ids,
+                )
+                conn.commit()
+                return len(ids)
+            except pymysql.MySQLError as exc:
+                conn.rollback()
+                raise DatabaseError(f"补写已点击任务状态失败: {exc}") from exc
+
     def claim_next(self, device_serial: str) -> SmsJob | None:
         token = uuid.uuid4().hex
         channel = f"adb:{device_serial[-12:]}"[:20]
@@ -267,6 +309,22 @@ class SmsRepository:
                     raise
                 raise DatabaseError(f"发送前拉黑校验失败: {exc}") from exc
 
+    def mark_clicked(self, job: SmsJob) -> None:
+        """Persist that adb accepted the tap before doing best-effort UI checks."""
+        with self.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE adb_sms_dispatch
+                SET state='CLICKED', send_clicked_at=NOW(), last_error=NULL
+                WHERE message_id=%s AND attempt_token=%s AND state='ARMED'
+                """,
+                (job.id, job.attempt_token),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise DatabaseError(f"任务 {job.id} 不在 ARMED 状态，无法记录点击")
+            conn.commit()
+
     def mark_success(self, job: SmsJob) -> None:
         with self.connection() as conn, conn.cursor() as cursor:
             try:
@@ -274,8 +332,9 @@ class SmsRepository:
                 cursor.execute(
                     """
                     UPDATE adb_sms_dispatch
-                    SET state='DONE', send_clicked_at=NOW(), finished_at=NOW(), last_error=NULL
-                    WHERE message_id=%s AND attempt_token=%s AND state='ARMED'
+                    SET state='DONE', send_clicked_at=COALESCE(send_clicked_at, NOW()),
+                        finished_at=NOW(), last_error=NULL
+                    WHERE message_id=%s AND attempt_token=%s AND state IN ('ARMED', 'CLICKED')
                     """,
                     (job.id, job.attempt_token),
                 )
@@ -339,7 +398,7 @@ class SmsRepository:
                        m.receiverPhoneMask, m.status
                 FROM adb_sms_dispatch d
                 JOIN message_info m ON m.id=d.message_id
-                WHERE d.state IN ('ARMED', 'UNKNOWN')
+                WHERE d.state IN ('ARMED', 'CLICKED', 'UNKNOWN')
                 ORDER BY d.update_time ASC
                 """
             )
@@ -356,7 +415,7 @@ class SmsRepository:
                     (message_id,),
                 )
                 row = cursor.fetchone()
-                if row is None or row["state"] not in {"ARMED", "UNKNOWN"}:
+                if row is None or row["state"] not in {"ARMED", "CLICKED", "UNKNOWN"}:
                     raise DatabaseError("该任务不是待人工确认状态")
                 if resolution == "sent":
                     cursor.execute(
@@ -384,3 +443,11 @@ class SmsRepository:
                 if isinstance(exc, DatabaseError):
                     raise
                 raise DatabaseError(f"人工处理任务失败: {exc}") from exc
+
+    def resolve_all_unknown(self, resolution: str) -> int:
+        jobs = self.unknown_jobs()
+        resolved = 0
+        for row in jobs:
+            self.resolve_unknown(int(row["message_id"]), resolution)
+            resolved += 1
+        return resolved

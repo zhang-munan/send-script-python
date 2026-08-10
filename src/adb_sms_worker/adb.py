@@ -6,6 +6,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
+from typing import Callable
 
 from .models import Device, UiTarget
 
@@ -334,22 +335,28 @@ class SmsUiSender:
                 self.adb.dump_activity_top(serial), sim_slot
             )
 
-    def click_and_verify(self, serial: str, target: UiTarget, sim_slot: int | None) -> None:
+    def click_and_verify(
+        self,
+        serial: str,
+        target: UiTarget,
+        sim_slot: int | None,
+        on_clicked: Callable[[], None] | None = None,
+    ) -> str:
         self.adb.tap(serial, target.x, target.y)
+        # Persist CLICKED immediately after adb accepted the tap. This closes
+        # the common gap where the physical send succeeds but a later UI dump
+        # fails and leaves the business row stuck in status=4.
+        if on_clicked is not None:
+            on_clicked()
         time.sleep(self.ui_wait_seconds)
         try:
             xml = self.adb.dump_ui(serial)
         except AdbError:
-            # Vendor fallback: after a successful send the composer clears and
-            # the active send control disappears. If it remains, keep the job
-            # UNKNOWN rather than risking an automatic duplicate.
-            try:
-                find_send_target_from_activity_dump(
-                    self.adb.dump_activity_top(serial), sim_slot
-                )
-            except UiTargetNotFound:
-                return
-            raise AdbError("点击后发送按钮仍处于可用状态，无法确认短信是否已发出")
+            # Older vivo builds keep the send View in the hierarchy even after
+            # the message was sent and deny UIAutomator access. Since the exact
+            # control was identified before the tap and adb accepted the tap,
+            # treat this as phone-side submission rather than a false UNKNOWN.
+            return "ADB_TAP"
         if sim_slot is not None:
             sim_target = find_sim_prompt_target(xml, sim_slot)
             if sim_target:
@@ -358,3 +365,4 @@ class SmsUiSender:
                 xml = self.adb.dump_ui(serial)
         if ui_has_send_failure(xml):
             raise AdbError("短信应用显示发送失败")
+        return "UI_CHECKED"
