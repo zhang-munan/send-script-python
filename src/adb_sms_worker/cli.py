@@ -26,6 +26,10 @@ def _parser() -> argparse.ArgumentParser:
     dump_ui = sub.add_parser("dump-ui", help="导出当前手机 UI XML，供适配机型")
     dump_ui.add_argument("--serial", required=True)
     dump_ui.add_argument("--output", default="ui-dump.xml")
+    prepare = sub.add_parser("prepare-test", help="只打开短信编辑页并识别发送按钮，绝不点击发送")
+    prepare.add_argument("--serial", required=True)
+    prepare.add_argument("--phone", default="10086", help="草稿收件号码，默认 10086")
+    prepare.add_argument("--content", default="ADB短信界面识别测试（不会发送）")
     test = sub.add_parser("send-test", help="发送一条真实测试短信（不操作数据库）")
     test.add_argument("--serial", required=True)
     test.add_argument("--phone", required=True)
@@ -86,6 +90,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"UI 已保存到 {output}；识别到发送按钮: {target.label} @ ({target.x},{target.y})")
             except AdbError as exc:
                 print(f"UI 已保存到 {output}；{exc}")
+            return 0
+
+        if args.command == "prepare-test":
+            sender = SmsUiSender(adb, settings.ui_wait_seconds)
+            target = sender.prepare(
+                args.serial,
+                args.phone,
+                args.content,
+                settings.wake_and_dismiss_keyguard,
+                settings.sim_slot,
+            )
+            print(
+                f"安全检查通过：识别到发送按钮 {target.label} @ ({target.x},{target.y})；"
+                "程序没有点击，短信没有发送"
+            )
             return 0
 
         if args.command == "send-test":

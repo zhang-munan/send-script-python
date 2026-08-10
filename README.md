@@ -68,6 +68,14 @@ adb-sms-worker doctor --serial 设备序列号 --with-db
 
 先用自己的测试号码真实发送一条：
 
+先执行只打开草稿、绝不点击发送的安全识别测试：
+
+```bash
+adb-sms-worker prepare-test --serial 设备序列号
+```
+
+识别成功后，再用自己的测试号码真实发送一条：
+
 ```bash
 adb-sms-worker send-test \
   --serial 设备序列号 \

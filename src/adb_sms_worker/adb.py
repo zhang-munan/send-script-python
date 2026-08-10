@@ -19,6 +19,11 @@ class UiTargetNotFound(AdbError):
 
 
 _BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+_ACTIVITY_VIEW_RE = re.compile(
+    r"^(?P<indent>\s+)(?P<class>[\w.$]+)\{[^}]*?\s"
+    r"(?P<x1>-?\d+),(?P<y1>-?\d+)-(?P<x2>-?\d+),(?P<y2>-?\d+)"
+    r"(?:\s+#[0-9a-fA-F]+\s+(?P<resource>\S+:id/\S+))?\s*\}$"
+)
 _SEND_WORDS = (
     "send sms",
     "send message",
@@ -149,6 +154,9 @@ class AdbClient:
         start = xml.find("<?xml")
         return xml[start:] if start >= 0 else xml
 
+    def dump_activity_top(self, serial: str) -> str:
+        return self.shell(serial, "dumpsys", "activity", "top", timeout=max(self.timeout, 30.0))
+
     def tap(self, serial: str, x: int, y: int) -> None:
         self.shell(serial, "input", "tap", str(x), str(y))
 
@@ -221,6 +229,69 @@ def find_send_target(xml: str, sim_slot: int | None = None) -> UiTarget:
     return max(candidates, key=lambda item: item.score)
 
 
+def find_send_target_from_activity_dump(
+    dump: str, sim_slot: int | None = None
+) -> UiTarget:
+    """Parse Android's indented View Hierarchy and calculate absolute bounds.
+
+    Some vendor SMS apps (notably older vivo builds) return a null root to
+    UIAutomator while still exposing their view tree through `dumpsys activity
+    top`. Coordinates in that tree are relative to the parent, so every matched
+    node is accumulated through the indentation stack instead of being treated
+    as a fixed screen coordinate.
+    """
+    stack: list[tuple[int, int, int]] = []
+    candidates: list[UiTarget] = []
+    for line in dump.splitlines():
+        match = _ACTIVITY_VIEW_RE.match(line)
+        if not match:
+            continue
+        indent = len(match.group("indent"))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent_x = stack[-1][1] if stack else 0
+        parent_y = stack[-1][2] if stack else 0
+        x1, y1, x2, y2 = (
+            int(match.group("x1")),
+            int(match.group("y1")),
+            int(match.group("x2")),
+            int(match.group("y2")),
+        )
+        absolute_x = parent_x + x1
+        absolute_y = parent_y + y1
+        stack.append((indent, absolute_x, absolute_y))
+        resource = match.group("resource") or ""
+        if x2 <= x1 or y2 <= y1 or "send" not in resource.lower():
+            continue
+        # Reuse the XML scoring rules by creating the minimal equivalent node.
+        node = ET.Element(
+            "node",
+            {
+                "resource-id": resource,
+                "text": "",
+                "content-desc": "",
+                "clickable": "true" if "C" in line.split("{", 1)[1].split()[1] else "false",
+                "enabled": "true",
+            },
+        )
+        score = _send_score(node, sim_slot)
+        if score < 60:
+            continue
+        candidates.append(
+            UiTarget(
+                x=absolute_x + (x2 - x1) // 2,
+                y=absolute_y + (y2 - y1) // 2,
+                resource_id=resource,
+                text="",
+                content_description="",
+                score=score,
+            )
+        )
+    if not candidates:
+        raise UiTargetNotFound("Activity View 层级中也没有识别到可用的发送按钮")
+    return max(candidates, key=lambda item: item.score)
+
+
 def ui_has_send_failure(xml: str) -> bool:
     lowered = xml.lower()
     return any(word in lowered for word in _FAILURE_WORDS)
@@ -256,12 +327,29 @@ class SmsUiSender:
             self.adb.wake_and_dismiss_keyguard(serial)
         self.adb.open_sms_composer(serial, phone, content)
         time.sleep(self.ui_wait_seconds)
-        return find_send_target(self.adb.dump_ui(serial), sim_slot)
+        try:
+            return find_send_target(self.adb.dump_ui(serial), sim_slot)
+        except (AdbError, UiTargetNotFound):
+            return find_send_target_from_activity_dump(
+                self.adb.dump_activity_top(serial), sim_slot
+            )
 
     def click_and_verify(self, serial: str, target: UiTarget, sim_slot: int | None) -> None:
         self.adb.tap(serial, target.x, target.y)
         time.sleep(self.ui_wait_seconds)
-        xml = self.adb.dump_ui(serial)
+        try:
+            xml = self.adb.dump_ui(serial)
+        except AdbError:
+            # Vendor fallback: after a successful send the composer clears and
+            # the active send control disappears. If it remains, keep the job
+            # UNKNOWN rather than risking an automatic duplicate.
+            try:
+                find_send_target_from_activity_dump(
+                    self.adb.dump_activity_top(serial), sim_slot
+                )
+            except UiTargetNotFound:
+                return
+            raise AdbError("点击后发送按钮仍处于可用状态，无法确认短信是否已发出")
         if sim_slot is not None:
             sim_target = find_sim_prompt_target(xml, sim_slot)
             if sim_target:
