@@ -48,6 +48,7 @@ class Settings:
     db_username: str
     db_password: str
     db_database: str
+    db_timezone: str
     adb_path: str
     device_serials: tuple[str, ...]
     poll_interval_seconds: float
@@ -62,6 +63,9 @@ class Settings:
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
         load_dotenv(Path(env_file))
+        db_timezone = os.getenv("DB_TIMEZONE", "+08:00").strip()
+        if db_timezone != "+08:00":
+            raise ValueError("DB_TIMEZONE 必须为业务统一时区 +08:00")
         serials = tuple(
             item.strip()
             for item in os.getenv("ADB_DEVICE_SERIALS", "").split(",")
@@ -77,6 +81,7 @@ class Settings:
             db_username=os.getenv("DB_USERNAME", ""),
             db_password=os.getenv("DB_PASSWORD", ""),
             db_database=os.getenv("DB_DATABASE", "db_bangni"),
+            db_timezone=db_timezone,
             adb_path=os.getenv("ADB_PATH", "adb"),
             device_serials=serials,
             poll_interval_seconds=_float("POLL_INTERVAL_SECONDS", 2.0),
@@ -97,4 +102,3 @@ class Settings:
             missing.append("DB_DATABASE")
         if missing:
             raise ValueError(f"缺少数据库配置: {', '.join(missing)}")
-

@@ -26,8 +26,17 @@ class ConfigTests(unittest.TestCase):
             settings = Settings.from_env("/does/not/exist")
             self.assertEqual(settings.device_serials, ("one", "two"))
             self.assertEqual(settings.sim_slot, 2)
+            self.assertEqual(settings.db_timezone, "+08:00")
+
+    def test_rejects_invalid_database_timezone(self):
+        with patch.dict(
+            os.environ,
+            {"DB_USERNAME": "u", "DB_TIMEZONE": "+00:00"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "DB_TIMEZONE"):
+                Settings.from_env("/does/not/exist")
 
 
 if __name__ == "__main__":
     unittest.main()
-

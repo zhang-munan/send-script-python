@@ -48,6 +48,8 @@ cp .env.example .env
 ```
 
 编辑 `.env`，填写和后端相同的数据库地址。密码只放 `.env`，该文件已被 Git 忽略。
+`DB_TIMEZONE` 默认使用 `+08:00`；后端和 worker 必须保持一致，定时发送的
+`scheduledAt` 才会和 MySQL `NOW()` 在同一时区比较。
 
 发布拉黑功能时，必须先执行后端提供的
 `backend/sql/20260808_add_message_blacklist.sql`。发送器启动时会检查
@@ -59,7 +61,9 @@ cp .env.example .env
 adb-sms-worker migrate
 ```
 
-该命令只创建 `adb_sms_dispatch`，不会修改或删除业务数据。
+该命令会创建 `adb_sms_dispatch`、`message_receiver_sms_stat` 和
+`message_receiver_notice`，不会修改或删除已有业务记录。它会把历史状态为 `5`
+的正文短信汇总为收件次数，但不会补发历史告知短信。
 
 ## 3. 真机诊断与单条验证
 
@@ -103,9 +107,14 @@ adb-sms-worker run
 任务筛选条件：
 
 - `auditStatus = 1`（审核通过）；
-- `status IN (1, 3)`（兼容当前后端已创建的“审核通过”和标准“待发送”记录）；
+- `status IN (1, 3)`（新消息统一使用 `3`，`1` 仅用于兼容历史记录）；
 - 立即发送，或 `scheduledAt <= NOW()`。
 - 收件账号没有拉黑该消息的发送账号。
+
+正文短信成功后，worker 会在同一个数据库事务中累计收件手机号次数：第 1 次以及
+第 5、10、15……次时，若手机号从未出现在 `user_info`，写入一条
+`message_receiver_notice` 告知任务。Node 后端每 10 秒消费该任务并通过
+`sms-tx` 腾讯云插件发送；发送前会再次检查手机号是否已经进入系统。
 
 抢占后 `message_info.status` 变为 `4`。手机端完成点击后变为 `5`；在点击前失败变为 `6`。多台手机可同时连接，留空 `ADB_DEVICE_SERIALS` 会自动使用全部在线且已授权的设备；也可填逗号分隔的白名单。
 

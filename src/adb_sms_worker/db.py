@@ -39,6 +39,14 @@ class SmsRepository:
         except pymysql.MySQLError as exc:
             raise DatabaseError(f"数据库连接失败: {exc}") from exc
         try:
+            # 定时筛选依赖 NOW()；显式设置每个会话的时区，避免跟随 MySQL
+            # 服务器默认时区而出现提前或延后发送。
+            with conn.cursor() as cursor:
+                cursor.execute("SET time_zone=%s", (self.settings.db_timezone,))
+        except pymysql.MySQLError as exc:
+            conn.close()
+            raise DatabaseError(f"设置数据库会话时区失败: {exc}") from exc
+        try:
             yield conn
         except pymysql.MySQLError as exc:
             try:
@@ -51,7 +59,10 @@ class SmsRepository:
 
     def ping(self) -> dict[str, object]:
         with self.connection() as conn, conn.cursor() as cursor:
-            cursor.execute("SELECT DATABASE() AS db, VERSION() AS version, NOW() AS now")
+            cursor.execute(
+                "SELECT DATABASE() AS db, VERSION() AS version, "
+                "NOW() AS now, @@session.time_zone AS session_timezone"
+            )
             return cursor.fetchone()
 
     def migrate(self) -> None:
@@ -75,6 +86,66 @@ class SmsRepository:
             cursor.execute("SHOW TABLES LIKE 'message_blacklist'")
             if cursor.fetchone() is None:
                 raise DatabaseError("找不到 message_blacklist 表，请先执行后端拉黑功能 SQL")
+            cursor.execute("SHOW TABLES LIKE 'message_receiver_notice'")
+            if cursor.fetchone() is None:
+                raise DatabaseError("找不到 message_receiver_notice 表，请先执行 migrate")
+            cursor.execute("SHOW TABLES LIKE 'message_receiver_sms_stat'")
+            if cursor.fetchone() is None:
+                raise DatabaseError("找不到 message_receiver_sms_stat 表，请先执行 migrate")
+
+    @staticmethod
+    def _is_notice_milestone(received_count: int) -> bool:
+        return received_count == 1 or (received_count > 0 and received_count % 5 == 0)
+
+    def _record_success_and_maybe_queue_notice(
+        self, cursor, message_id: int, receiver_phone: str
+    ) -> None:
+        """Must run in the same transaction as the message success transition."""
+        cursor.execute(
+            """
+            INSERT INTO message_receiver_sms_stat
+              (phone, receivedCount, lastNoticeTriggerCount, lastMessageId,
+               createTime, updateTime)
+            VALUES (%s, 1, 0, %s, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+              receivedCount=receivedCount+1,
+              lastMessageId=VALUES(lastMessageId), updateTime=NOW()
+            """,
+            (receiver_phone, message_id),
+        )
+        cursor.execute(
+            "SELECT receivedCount FROM message_receiver_sms_stat WHERE phone=%s FOR UPDATE",
+            (receiver_phone,),
+        )
+        received_count = int(cursor.fetchone()["receivedCount"])
+        if not self._is_notice_milestone(received_count):
+            return
+
+        # user_info 中保留已注销账号；只要手机号曾经进入系统就不再发送引导。
+        cursor.execute(
+            "SELECT 1 FROM user_info WHERE phone=%s LIMIT 1",
+            (receiver_phone,),
+        )
+        if cursor.fetchone() is not None:
+            return
+        cursor.execute(
+            """
+            INSERT IGNORE INTO message_receiver_notice
+              (phone, triggerCount, sourceMessageId, status, attempts,
+               createTime, updateTime)
+            VALUES (%s, %s, %s, 0, 0, NOW(), NOW())
+            """,
+            (receiver_phone, received_count, message_id),
+        )
+        if cursor.rowcount == 1:
+            cursor.execute(
+                """
+                UPDATE message_receiver_sms_stat
+                SET lastNoticeTriggerCount=%s, updateTime=NOW()
+                WHERE phone=%s
+                """,
+                (received_count, receiver_phone),
+            )
 
     def recover_stale_pre_send(self, stale_seconds: int) -> int:
         """Requeue only states in which the send button was definitely not armed."""
@@ -83,7 +154,7 @@ class SmsRepository:
                 conn.begin()
                 cursor.execute(
                     """
-                    SELECT d.message_id
+                    SELECT d.message_id, m.receiverPhone
                     FROM adb_sms_dispatch d
                     JOIN message_info m ON m.id = d.message_id
                     WHERE d.state IN ('CLAIMED', 'COMPOSER_OPEN')
@@ -93,7 +164,8 @@ class SmsRepository:
                     """,
                     (stale_seconds,),
                 )
-                ids = [int(row["message_id"]) for row in cursor.fetchall()]
+                rows = list(cursor.fetchall())
+                ids = [int(row["message_id"]) for row in rows]
                 if not ids:
                     conn.commit()
                     return 0
@@ -119,14 +191,15 @@ class SmsRepository:
                 conn.begin()
                 cursor.execute(
                     """
-                    SELECT d.message_id
+                    SELECT d.message_id, m.receiverPhone
                     FROM adb_sms_dispatch d
                     JOIN message_info m ON m.id=d.message_id
                     WHERE d.state='CLICKED' AND m.status=4
                     FOR UPDATE
                     """
                 )
-                ids = [int(row["message_id"]) for row in cursor.fetchall()]
+                rows = list(cursor.fetchall())
+                ids = [int(row["message_id"]) for row in rows]
                 if not ids:
                     conn.commit()
                     return 0
@@ -148,6 +221,12 @@ class SmsRepository:
                     """,
                     ids,
                 )
+                for row in rows:
+                    self._record_success_and_maybe_queue_notice(
+                        cursor,
+                        int(row["message_id"]),
+                        str(row["receiverPhone"]),
+                    )
                 conn.commit()
                 return len(ids)
             except pymysql.MySQLError as exc:
@@ -351,6 +430,9 @@ class SmsRepository:
                 )
                 if cursor.rowcount != 1:
                     raise DatabaseError(f"任务 {job.id} 的 message_info 状态已变化")
+                self._record_success_and_maybe_queue_notice(
+                    cursor, job.id, job.receiver_phone
+                )
                 conn.commit()
             except (pymysql.MySQLError, DatabaseError) as exc:
                 conn.rollback()
@@ -426,6 +508,16 @@ class SmsRepository:
                         "UPDATE message_info SET status=5, deliveredAt=NOW(), failReason=NULL, updateTime=NOW() WHERE id=%s AND status=4",
                         (message_id,),
                     )
+                    message_updated = cursor.rowcount == 1
+                    if message_updated:
+                        cursor.execute(
+                            "SELECT receiverPhone FROM message_info WHERE id=%s",
+                            (message_id,),
+                        )
+                        message = cursor.fetchone()
+                        self._record_success_and_maybe_queue_notice(
+                            cursor, message_id, str(message["receiverPhone"])
+                        )
                 else:
                     cursor.execute(
                         "UPDATE adb_sms_dispatch SET state='MANUAL_RETRY', finished_at=NOW(), last_error='人工确认未发送，重新排队' WHERE message_id=%s",
@@ -435,7 +527,8 @@ class SmsRepository:
                         "UPDATE message_info SET status=3, retryCount=retryCount+1, failReason=NULL, updateTime=NOW() WHERE id=%s AND status=4",
                         (message_id,),
                     )
-                if cursor.rowcount != 1:
+                    message_updated = cursor.rowcount == 1
+                if not message_updated:
                     raise DatabaseError("message_info 状态不是发送中，未作修改")
                 conn.commit()
             except (pymysql.MySQLError, DatabaseError) as exc:
