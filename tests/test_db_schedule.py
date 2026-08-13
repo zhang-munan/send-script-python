@@ -16,6 +16,7 @@ class ClaimScheduleQueryTests(unittest.TestCase):
 
         self.assertIn("auditStatus = 1", sql)
         self.assertIn("status IN (1, 3)", sql)
+        self.assertIn("setting.blockAllSms = 1", sql)
         self.assertIn("sendType = 1 OR", sql)
         self.assertIn(
             "sendType = 2 AND scheduledAt IS NOT NULL AND scheduledAt <= NOW()",

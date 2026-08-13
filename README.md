@@ -115,6 +115,8 @@ adb-sms-worker run
 第 5、10、15……次时，若手机号从未出现在 `user_info`，写入一条
 `message_receiver_notice` 告知任务。Node 后端每 10 秒消费该任务并通过
 `sms-tx` 腾讯云插件发送；发送前会再次检查手机号是否已经进入系统。
+只有 `base_sys_param.recipientNoticeSmsEnabled` 的参数值为 `1` 时才创建和发送告知
+任务；默认值为 `0`，关闭时正文短信次数仍会累计。
 
 抢占后 `message_info.status` 变为 `4`。手机端完成点击后变为 `5`；在点击前失败变为 `6`。多台手机可同时连接，留空 `ADB_DEVICE_SERIALS` 会自动使用全部在线且已授权的设备；也可填逗号分隔的白名单。
 

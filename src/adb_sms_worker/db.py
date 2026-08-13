@@ -97,6 +97,20 @@ class SmsRepository:
     def _is_notice_milestone(received_count: int) -> bool:
         return received_count == 1 or (received_count > 0 and received_count % 5 == 0)
 
+    @staticmethod
+    def _enabled_param_value(value: object) -> bool:
+        if value is True or value == 1:
+            return True
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+    def _recipient_notice_enabled(self, cursor) -> bool:
+        cursor.execute(
+            "SELECT data FROM base_sys_param WHERE keyName=%s LIMIT 1",
+            ("recipientNoticeSmsEnabled",),
+        )
+        row = cursor.fetchone()
+        return bool(row) and self._enabled_param_value(row["data"])
+
     def _record_success_and_maybe_queue_notice(
         self, cursor, message_id: int, receiver_phone: str
     ) -> None:
@@ -119,6 +133,10 @@ class SmsRepository:
         )
         received_count = int(cursor.fetchone()["receivedCount"])
         if not self._is_notice_milestone(received_count):
+            return
+
+        # 开关关闭时仍累计正文短信次数，但不创建腾讯云告知任务。
+        if not self._recipient_notice_enabled(cursor):
             return
 
         # user_info 中保留已注销账号；只要手机号曾经进入系统就不再发送引导。
@@ -255,6 +273,15 @@ class SmsRepository:
                         WHERE receiver.phone = message_info.receiverPhone
                           AND receiver.status = 1
                       )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM user_info receiver
+                        JOIN setting_user setting
+                          ON setting.userId = receiver.id
+                         AND setting.blockAllSms = 1
+                        WHERE receiver.phone = message_info.receiverPhone
+                          AND receiver.status = 1
+                      )
                       AND (
                         sendType = 1
                         OR (sendType = 2 AND scheduledAt IS NOT NULL AND scheduledAt <= NOW())
@@ -329,43 +356,55 @@ class SmsRepository:
         self._set_dispatch_state(job, "COMPOSER_OPEN", "composer_opened_at")
 
     def arm_send(self, job: SmsJob) -> bool:
-        """Atomically recheck the blacklist immediately before enabling the click."""
+        """Atomically recheck all recipient blocks before enabling the click."""
         with self.connection() as conn, conn.cursor() as cursor:
             try:
                 conn.begin()
                 cursor.execute(
                     """
-                    SELECT 1
+                    SELECT CASE
+                             WHEN setting.blockAllSms = 1 THEN 'ALL'
+                             WHEN blacklist.id IS NOT NULL THEN 'SENDER'
+                           END AS block_type
                     FROM message_info message
                     JOIN user_info receiver
                       ON receiver.phone = message.receiverPhone
                      AND receiver.status = 1
-                    JOIN message_blacklist blacklist
+                    LEFT JOIN setting_user setting
+                      ON setting.userId = receiver.id
+                    LEFT JOIN message_blacklist blacklist
                       ON blacklist.blockerUserId = receiver.id
                      AND blacklist.blockedUserId = message.userId
                      AND blacklist.status = 1
                     WHERE message.id=%s
+                      AND (setting.blockAllSms = 1 OR blacklist.id IS NOT NULL)
                     LIMIT 1
                     FOR UPDATE
                     """,
                     (job.id,),
                 )
-                if cursor.fetchone() is not None:
+                blocked = cursor.fetchone()
+                if blocked is not None:
+                    blocks_all = blocked["block_type"] == "ALL"
+                    dispatch_error = (
+                        "收件人已屏蔽所有短信" if blocks_all else "收件人已拉黑发送者"
+                    )
+                    message_error = f"{dispatch_error}，系统自动取消"
                     cursor.execute(
                         """
                         UPDATE adb_sms_dispatch
-                        SET state='BLOCKED', finished_at=NOW(), last_error='收件人已拉黑发送者'
+                        SET state='BLOCKED', finished_at=NOW(), last_error=%s
                         WHERE message_id=%s AND attempt_token=%s AND state IN ('CLAIMED', 'COMPOSER_OPEN')
                         """,
-                        (job.id, job.attempt_token),
+                        (dispatch_error, job.id, job.attempt_token),
                     )
                     cursor.execute(
                         """
                         UPDATE message_info
-                        SET status=7, failReason='收件人已拉黑发送者，系统自动取消', updateTime=NOW()
+                        SET status=7, failReason=%s, updateTime=NOW()
                         WHERE id=%s AND status=4 AND smsMsgId=%s
                         """,
-                        (job.id, f"adb:{job.attempt_token}"),
+                        (message_error, job.id, f"adb:{job.attempt_token}"),
                     )
                     conn.commit()
                     return False

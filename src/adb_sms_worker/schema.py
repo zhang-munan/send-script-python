@@ -72,4 +72,14 @@ SCHEMA_STATEMENTS = (
     GROUP BY receiverPhone
     ON DUPLICATE KEY UPDATE phone=VALUES(phone)
     """,
+    """
+    INSERT INTO base_sys_param
+      (keyName, name, data, dataType, remark, createTime, updateTime)
+    SELECT 'recipientNoticeSmsEnabled', '腾讯云收件人告知短信开关', '0', 0,
+           '0关闭，1开启；仅控制收件人第1/5/10次告知，不影响登录验证码',
+           NOW(), NOW()
+    WHERE NOT EXISTS (
+      SELECT 1 FROM base_sys_param WHERE keyName='recipientNoticeSmsEnabled'
+    )
+    """,
 )
