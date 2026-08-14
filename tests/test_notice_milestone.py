@@ -18,6 +18,30 @@ class RecipientNoticeMilestoneTests(unittest.TestCase):
         for value in ("0", "false", "", None, 0, False):
             self.assertFalse(SmsRepository._enabled_param_value(value))
 
+    def test_daily_queue_guard_uses_database_date(self):
+        class Cursor:
+            def __init__(self, row):
+                self.row = row
+                self.sql = ""
+                self.params = None
+
+            def execute(self, sql, params):
+                self.sql = " ".join(sql.split())
+                self.params = params
+
+            def fetchone(self):
+                return self.row
+
+        repository = SmsRepository.__new__(SmsRepository)
+        cursor = Cursor({"1": 1})
+
+        self.assertTrue(
+            repository._notice_already_queued_today(cursor, "13800138000")
+        )
+        self.assertIn("CURDATE()", cursor.sql)
+        self.assertIn("INTERVAL 1 DAY", cursor.sql)
+        self.assertEqual(cursor.params, ("13800138000",))
+
 
 if __name__ == "__main__":
     unittest.main()

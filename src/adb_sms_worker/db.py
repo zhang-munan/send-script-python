@@ -111,6 +111,23 @@ class SmsRepository:
         row = cursor.fetchone()
         return bool(row) and self._enabled_param_value(row["data"])
 
+    def _notice_already_queued_today(self, cursor, receiver_phone: str) -> bool:
+        """Use the database session date so the daily limit follows DB_TIMEZONE."""
+        cursor.execute(
+            """
+            SELECT 1
+            FROM message_receiver_notice
+            WHERE phone=%s
+              AND createTime >= CONCAT(CURDATE(), ' 00:00:00')
+              AND createTime < CONCAT(
+                DATE_ADD(CURDATE(), INTERVAL 1 DAY), ' 00:00:00'
+              )
+            LIMIT 1
+            """,
+            (receiver_phone,),
+        )
+        return cursor.fetchone() is not None
+
     def _record_success_and_maybe_queue_notice(
         self, cursor, message_id: int, receiver_phone: str
     ) -> None:
@@ -146,6 +163,12 @@ class SmsRepository:
         )
         if cursor.fetchone() is not None:
             return
+
+        # The per-phone statistics row is locked above, so concurrent successful
+        # business messages for the same number cannot both pass this daily guard.
+        if self._notice_already_queued_today(cursor, receiver_phone):
+            return
+
         cursor.execute(
             """
             INSERT IGNORE INTO message_receiver_notice
