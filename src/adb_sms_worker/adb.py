@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import asdict
 from typing import Callable
 
@@ -293,9 +294,32 @@ def find_send_target_from_activity_dump(
     return max(candidates, key=lambda item: item.score)
 
 
-def ui_has_send_failure(xml: str) -> bool:
-    lowered = xml.lower()
-    return any(word in lowered for word in _FAILURE_WORDS)
+def _send_failure_evidence(xml: str) -> Counter[str]:
+    """Count visible failure labels without depending on bounds or node ids.
+
+    A conversation can legitimately contain an older failed message.  Counting
+    normalized labels lets the post-click check distinguish that existing
+    label from a failure indicator newly added for the message just sent.
+    """
+    evidence: Counter[str] = Counter()
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return evidence
+    for node in root.iter("node"):
+        for attribute in ("text", "content-desc"):
+            label = " ".join(node.attrib.get(attribute, "").lower().split())
+            if label and any(word in label for word in _FAILURE_WORDS):
+                evidence[label] += 1
+    return evidence
+
+
+def ui_has_send_failure(xml: str, baseline_xml: str | None = None) -> bool:
+    current = _send_failure_evidence(xml)
+    if baseline_xml is None:
+        return bool(current)
+    baseline = _send_failure_evidence(baseline_xml)
+    return any(count > baseline[label] for label, count in current.items())
 
 
 def find_sim_prompt_target(xml: str, sim_slot: int) -> UiTarget | None:
@@ -322,18 +346,25 @@ class SmsUiSender:
     def __init__(self, adb: AdbClient, ui_wait_seconds: float = 1.2):
         self.adb = adb
         self.ui_wait_seconds = ui_wait_seconds
+        self._failure_baselines: dict[str, str | None] = {}
 
     def prepare(self, serial: str, phone: str, content: str, wake: bool, sim_slot: int | None) -> UiTarget:
         if wake:
             self.adb.wake_and_dismiss_keyguard(serial)
         self.adb.open_sms_composer(serial, phone, content)
         time.sleep(self.ui_wait_seconds)
+        baseline_xml: str | None = None
         try:
-            return find_send_target(self.adb.dump_ui(serial), sim_slot)
+            baseline_xml = self.adb.dump_ui(serial)
+            return find_send_target(baseline_xml, sim_slot)
         except (AdbError, UiTargetNotFound):
             return find_send_target_from_activity_dump(
                 self.adb.dump_activity_top(serial), sim_slot
             )
+        finally:
+            # Keep the pre-click UI only until this device's next send attempt.
+            # Each device owns one worker, so attempts on a serial never overlap.
+            self._failure_baselines[serial] = baseline_xml
 
     def click_and_verify(
         self,
@@ -342,6 +373,7 @@ class SmsUiSender:
         sim_slot: int | None,
         on_clicked: Callable[[], None] | None = None,
     ) -> str:
+        baseline_xml = self._failure_baselines.pop(serial, None)
         self.adb.tap(serial, target.x, target.y)
         # Persist CLICKED immediately after adb accepted the tap. This closes
         # the common gap where the physical send succeeds but a later UI dump
@@ -362,7 +394,13 @@ class SmsUiSender:
             if sim_target:
                 self.adb.tap(serial, sim_target.x, sim_target.y)
                 time.sleep(self.ui_wait_seconds)
-                xml = self.adb.dump_ui(serial)
-        if ui_has_send_failure(xml):
+                try:
+                    xml = self.adb.dump_ui(serial)
+                except AdbError:
+                    # The SIM choice was accepted and the actual send tap was
+                    # issued. Some vendor apps immediately stop exposing their
+                    # hierarchy at this point, just like the single-SIM path.
+                    return "ADB_TAP"
+        if ui_has_send_failure(xml, baseline_xml):
             raise AdbError("短信应用显示发送失败")
         return "UI_CHECKED"

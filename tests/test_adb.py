@@ -1,10 +1,13 @@
 import unittest
 
 from adb_sms_worker.adb import (
+    AdbError,
+    SmsUiSender,
     UiTargetNotFound,
     find_send_target,
     find_send_target_from_activity_dump,
     find_sim_prompt_target,
+    ui_has_send_failure,
 )
 
 
@@ -58,6 +61,112 @@ class SendTargetTests(unittest.TestCase):
         target = find_send_target_from_activity_dump(dump)
         self.assertEqual(target.label, "app:id/send_button")
         self.assertEqual((target.x, target.y), (982, 2265))
+
+
+class SendResultTests(unittest.TestCase):
+    def test_ignores_failure_label_already_visible_before_click(self):
+        before = hierarchy(
+            '<node resource-id="old" text="未发送" content-desc="" bounds="[0,0][10,10]" />'
+        )
+        after = hierarchy(
+            '<node resource-id="old-moved" text="未发送" content-desc="" bounds="[0,20][10,30]" />',
+            '<node resource-id="new" text="刚刚发送的消息" content-desc="" bounds="[0,40][10,50]" />',
+        )
+        self.assertFalse(ui_has_send_failure(after, before))
+
+    def test_detects_failure_label_newly_added_after_click(self):
+        before = hierarchy(
+            '<node resource-id="message" text="待发送" content-desc="" bounds="[0,0][10,10]" />'
+        )
+        after = hierarchy(
+            '<node resource-id="message" text="待发送" content-desc="" bounds="[0,0][10,10]" />',
+            '<node resource-id="error" text="发送失败" content-desc="" bounds="[0,20][10,30]" />',
+        )
+        self.assertTrue(ui_has_send_failure(after, before))
+
+    def test_sender_does_not_reject_success_because_of_historical_failure(self):
+        old_failure = hierarchy(
+            '<node resource-id="old" text="未发送" content-desc="" bounds="[0,0][10,10]" />',
+            '<node resource-id="send" text="发送" content-desc="" clickable="true" enabled="true" bounds="[20,20][40,40]" />',
+        )
+        after = hierarchy(
+            '<node resource-id="old" text="未发送" content-desc="" bounds="[0,0][10,10]" />',
+            '<node resource-id="sent" text="本次消息" content-desc="" bounds="[0,50][10,60]" />',
+        )
+
+        class FakeAdb:
+            def __init__(self):
+                self.dumps = [old_failure, after]
+
+            def open_sms_composer(self, *_args):
+                pass
+
+            def dump_ui(self, *_args):
+                return self.dumps.pop(0)
+
+            def tap(self, *_args):
+                pass
+
+        sender = SmsUiSender(FakeAdb(), ui_wait_seconds=0)
+        target = sender.prepare("new-phone", "13800138000", "本次消息", False, None)
+        self.assertEqual(sender.click_and_verify("new-phone", target, None), "UI_CHECKED")
+
+    def test_sender_reports_new_failure_after_click(self):
+        before = hierarchy(
+            '<node resource-id="send" text="发送" content-desc="" clickable="true" enabled="true" bounds="[20,20][40,40]" />'
+        )
+        after = hierarchy(
+            '<node resource-id="error" text="发送失败" content-desc="" bounds="[0,50][10,60]" />'
+        )
+
+        class FakeAdb:
+            def __init__(self):
+                self.dumps = [before, after]
+
+            def open_sms_composer(self, *_args):
+                pass
+
+            def dump_ui(self, *_args):
+                return self.dumps.pop(0)
+
+            def tap(self, *_args):
+                pass
+
+        sender = SmsUiSender(FakeAdb(), ui_wait_seconds=0)
+        target = sender.prepare("new-phone", "13800138000", "本次消息", False, None)
+        with self.assertRaisesRegex(AdbError, "短信应用显示发送失败"):
+            sender.click_and_verify("new-phone", target, None)
+
+    def test_sender_accepts_sim_tap_when_vendor_hides_ui_afterward(self):
+        before = hierarchy(
+            '<node resource-id="send" text="发送" content-desc="" clickable="true" enabled="true" bounds="[20,20][40,40]" />'
+        )
+        sim_prompt = hierarchy(
+            '<node resource-id="title" text="选择 SIM" content-desc="" bounds="[0,0][100,20]" />',
+            '<node resource-id="sim1" text="SIM 1" content-desc="" clickable="true" enabled="true" bounds="[0,20][100,50]" />',
+        )
+
+        class FakeAdb:
+            def __init__(self):
+                self.dumps = [before, sim_prompt]
+                self.tap_count = 0
+
+            def open_sms_composer(self, *_args):
+                pass
+
+            def dump_ui(self, *_args):
+                if self.dumps:
+                    return self.dumps.pop(0)
+                raise AdbError("vendor UI is no longer readable")
+
+            def tap(self, *_args):
+                self.tap_count += 1
+
+        adb = FakeAdb()
+        sender = SmsUiSender(adb, ui_wait_seconds=0)
+        target = sender.prepare("dual-sim-phone", "13800138000", "本次消息", False, 1)
+        self.assertEqual(sender.click_and_verify("dual-sim-phone", target, 1), "ADB_TAP")
+        self.assertEqual(adb.tap_count, 2)
 
 
 if __name__ == "__main__":
